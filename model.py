@@ -156,12 +156,14 @@ class Block(nn.Module):
         if (self.config.use_nGPT == 0):
             hin = self.rmsnorm_mlp(h)
         uv = self.c_fc(hin)
+        uv = self.justnorm(uv) # Add normalization to make 1st MLP layer scale-invariant
         if (self.config.use_nGPT == 1):
             suv = (self.suv * ((self.suv_init_value/self.suv_init_scaling) * (self.config.n_embd ** 0.5))) 
             uv = suv * uv  
         u, v = torch.chunk(uv, 2, dim=-1)
         x_mlp = u * self.silu(v)
-        h_mlp = self.mlp_c_proj(x_mlp)
+        h_mlp = self.mlp_c_proj(x_mlp) # the following normalization of h_mlp makes
+                                       # the 2nd layer of MLP scale-invariant too
 
         if (self.config.use_nGPT == 0):
             h = h + h_mlp
@@ -264,13 +266,19 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.base_scale)
 
+    def justnorm(self, x):
+        #return F.normalize(x, p=2, dim=-1)
+        res = x / x.norm(p=2, dim=-1, keepdim=True)
+        return res
+
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         #assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
 
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        
+        tok_emb = self.justnorm(tok_emb) # normalize to ensure scale-invariance of embedding matrices
+
         x = tok_emb
         for block in self.transformer.h:
             x = block(x)
@@ -280,6 +288,7 @@ class GPT(nn.Module):
 
         if targets is not None:
             logits = self.lm_head(x)
+            logits = self.justnorm(logits) # normalize to ensure scale-invariance of output layer
             if (self.config.use_nGPT == 1):
                 sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
                 logits = sz * logits
@@ -287,6 +296,7 @@ class GPT(nn.Module):
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = self.justnorm(logits)  # normalize to ensure scale-invariance of output layer
             if (self.config.use_nGPT == 1):
                 sz = self.sz * (self.sz_init_value/self.sz_init_scaling)
                 logits = sz * logits
@@ -295,7 +305,7 @@ class GPT(nn.Module):
         return logits, loss
 
 
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+    def configure_optimizers(self, opt_type, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
         # filter out those that do not require grad
@@ -316,7 +326,13 @@ class GPT(nn.Module):
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
         use_fused = False#fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
+        if opt_type == 'sgd':
+            optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, weight_decay=weight_decay)
+        elif opt_type == 'adamw':
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+            print(f"using fused AdamW: {use_fused}")
+        else:
+            raise ValueError(f"Unknown optimizer type {opt_type}")
+
         return optimizer
 

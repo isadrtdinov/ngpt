@@ -66,11 +66,12 @@ eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
-wandb_log = False # disabled by default
-wandb_project = 'owt'
+wandb_log = True # disabled by default
+wandb_project = 'nGPT'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
+data_dir = os.path.join('../nanoGPT/data', dataset)
 gradient_accumulation_steps = 64 # used to simulate larger batch sizes
 batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # model
@@ -82,14 +83,15 @@ beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
-decay_lr = True # whether to decay the learning rate
+decay_lr = False # whether to decay the learning rate
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
+opt_type = 'sgd'
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = False # use PyTorch 2.0 to compile the model to be faster
+compile = True # use PyTorch 2.0 to compile the model to be faster
 # 
 time_limit_seconds = 1000000000     # stop after x seconds 
 max_iters_per_launch = 1000000000   # stop after x steps of the current
@@ -176,10 +178,12 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 tdataloading_begin = time.time()
+'''
 if os.path.exists('./../../data'):
     data_dir = os.path.join('./../../data', dataset)
 else:   
     data_dir = os.path.join('data', dataset)
+'''
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
@@ -258,7 +262,7 @@ model.to(device)
 print("Model initialization/loading time: %f sec" % (time.time()-tmodelinit_begin))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = model.configure_optimizers(opt_type, weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 checkpoint = None # free up memory
@@ -407,8 +411,10 @@ def normalize_matrices():
         block.c_fc.weight.data.copy_(justnorm(block.c_fc.weight.data, 1))               # n_proj, n_embd
         block.mlp_c_proj.weight.data.copy_(justnorm(block.mlp_c_proj.weight.data, 0))   # n_embd, n_proj
 
-if (use_nGPT == 1):
-    normalize_matrices()
+''' Remove normalization to track dynamics in the whole space
+if (use_nGPT == 1):  
+    normalize_matrices() 
+'''
 
 while True:
     #sys.stdout.flush()
@@ -495,9 +501,11 @@ while True:
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
         print(f"iter {iter_num}: loss {lossf:.6f}, time {dt*1000:.2f}ms")
-    
+
+    ''' Remove normalization to track dynamics in the whole space
     if (use_nGPT == 1):
         normalize_matrices()
+    '''
 
     if (iter_num % 100 == 0) and master_process:
         print("lr=%f" % lr)
