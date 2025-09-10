@@ -327,7 +327,7 @@ class GPT(nn.Module):
         use_fused = False#fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
         if opt_type == 'sgd':
-            optimizer = torch.optim.SGD(optim_groups, lr=learning_rate, weight_decay=weight_decay)
+            optimizer = torch.optim.SGD(optim_groups, lr=learning_rate)
         elif opt_type == 'adamw':
             optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
             print(f"using fused AdamW: {use_fused}")

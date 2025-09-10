@@ -53,6 +53,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 from model import GPTConfig, GPT
+from entropy import EntropyLogger
 from torch.nn import functional as F
 from datetime import timedelta
 
@@ -71,21 +72,24 @@ wandb_project = 'nGPT'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-data_dir = os.path.join('../nanoGPT/data', dataset)
-gradient_accumulation_steps = 64 # used to simulate larger batch sizes
-batch_size = 8 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 1 # used to simulate larger batch sizes
+batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # model
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
+opt_type = 'sgd'
 max_iters = 600000 # total number of training iterations
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = False # whether to decay the learning rate
-lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
-opt_type = 'sgd'
+fix_elr = False # whether to train with fixed ELR instead of fixed LR
+lr_decay_iters = 600000 # should be ~= max_iters per
+# entropy estimation params
+entropy_queue_size = 100
+entropy_log_freq = 50
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -101,9 +105,9 @@ learning_rate = 15e-4
 
 # model size and seqlen
 if (1): 
-    n_layer = 12
-    n_head = 16
-    n_embd = 1024
+    n_layer = 6
+    n_head = 12
+    n_embd = 768
     block_size = 1024 # = context/sequence length
 
 if (use_nGPT == 0):
@@ -178,12 +182,10 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 tdataloading_begin = time.time()
-'''
 if os.path.exists('./../../data'):
     data_dir = os.path.join('./../../data', dataset)
 else:   
     data_dir = os.path.join('data', dataset)
-'''
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 
@@ -416,10 +418,24 @@ if (use_nGPT == 1):
     normalize_matrices() 
 '''
 
+def get_param_vectors():
+    # start with all of the candidate parameters
+    param_dict = {pn: p for pn, p in raw_model.named_parameters()}
+    # filter out those that do not require grad
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    # Any 2D parameters are scale invariant, otherwise no.
+    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+    si_params = torch.cat([p.data.clone().cpu().reshape(-1) for n, p in param_dict.items() if p.dim() >= 2])
+    non_si_params = torch.cat([p.data.clone().cpu().reshape(-1) for n, p in param_dict.items() if p.dim() < 2])
+    return si_params, non_si_params
+
+entropy_logger = EntropyLogger(queue_size=entropy_queue_size)
+
 while True:
     #sys.stdout.flush()
     if (local_iter_num > max_iters_per_launch):
         break
+
     if (1):
         local_seed = 100*iter_num + seed_offset # local_seed should never exceed 2.147e+9 because of np.random.seed, 100 here should be > nworkers
         np.random.seed(local_seed)
@@ -430,21 +446,47 @@ while True:
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
+    if fix_elr:
+        si_params, _ = get_param_vectors()
+        lr = lr * si_params.square().sum().item()
+
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr 
+
+    # add current weights to entropy estimation queue
+    if iter_num % entropy_log_freq == 0 and master_process:
+        si_params, _ = get_param_vectors()
+        entropy_logger.add_weights(si_params)
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         rng_state_pytorch = torch.get_rng_state()
         rng_state_bytes = rng_state_pytorch.numpy().tobytes()
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.6f}, val loss {losses['val']:.6f}")
-       
+        spherical_entropy, log_radius = logger.get_entropy()
+        si_params, non_si_params = get_param_vectors()
+        si_radius = si_params.square().sum().sqrt().item()
+        non_si_radius = non_si_params.square().sum().sqrt().item()
+        total_radius = math.sqrt(si_radius ** 2 + non_si_radius ** 2)
+        print(
+            f"step {iter_num}: train loss {losses['train']:.6f}, val loss {losses['val']:.6f}, "
+            f"spherical entropy: {spherical_entropy:.2f}, radius correction {log_radius:.2f}, "
+            f"total entropy: {spherical_entropy + log_radius:.2f}, "
+            f"si radius: {si_radius:.2f}, non-si radius: {non_si_radius:.2f}, "
+            f"total radius: {total_radius:.2f}"
+        )
+
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
+                "entropy/sphere": spherical_entropy,
+                "entropy/radius": log_radius,
+                "entropy/total": spherical_entropy + log_radius,
+                "radius/scale-inv": si_radius,
+                "radius/non-scale-inv": non_si_radius,
+                "radius/total": total_radius,
                 "lr": lr
             })
 
@@ -500,7 +542,19 @@ while True:
         # get loss as float. note: this is a CPU-GPU sync point
         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
+        si_params, non_si_params = get_param_vectors()
+        si_radius = si_params.square().sum().sqrt().item()
+        non_si_radius = non_si_params.square().sum().sqrt().item()
+        total_radius = math.sqrt(si_radius ** 2 + non_si_radius ** 2)
         print(f"iter {iter_num}: loss {lossf:.6f}, time {dt*1000:.2f}ms")
+        wandb.log({
+            "iter": iter_num,
+            "loss": lossf,
+            "si_radius": si_radius,
+            "non_si_radius": non_si_radius,
+            "total_radius": total_radius,
+            "lr": lr
+        })
 
     ''' Remove normalization to track dynamics in the whole space
     if (use_nGPT == 1):

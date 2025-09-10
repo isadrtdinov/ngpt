@@ -2,7 +2,6 @@ import torch
 import numpy as np
 from collections import deque
 from scipy.special import loggamma
-from sklearn.neighbors import NearestNeighbors
 
 
 def to_spherical(x):
