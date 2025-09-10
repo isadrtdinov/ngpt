@@ -477,7 +477,7 @@ while True:
         )
 
         if wandb_log:
-            wandb.log({
+            log_dict = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
@@ -488,7 +488,14 @@ while True:
                 "radius/non-scale-inv": non_si_radius,
                 "radius/total": total_radius,
                 "lr": lr
-            })
+            }
+            if iter_num == start_iter_num:
+                log_dict.update({
+                    'num_si_params': len(si_params),
+                    'num_non_si_params': len(non_si_params),
+                })
+
+            wandb.log(log_dict)
 
         if always_save_checkpoint:
             if iter_num > starting_iter_num:
@@ -547,14 +554,15 @@ while True:
         non_si_radius = non_si_params.square().sum().sqrt().item()
         total_radius = math.sqrt(si_radius ** 2 + non_si_radius ** 2)
         print(f"iter {iter_num}: loss {lossf:.6f}, time {dt*1000:.2f}ms")
-        wandb.log({
-            "iter": iter_num,
-            "loss": lossf,
-            "si_radius": si_radius,
-            "non_si_radius": non_si_radius,
-            "total_radius": total_radius,
-            "lr": lr
-        })
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "loss": lossf,
+                "si_radius": si_radius,
+                "non_si_radius": non_si_radius,
+                "total_radius": total_radius,
+                "lr": lr
+            })
 
     ''' Remove normalization to track dynamics in the whole space
     if (use_nGPT == 1):
