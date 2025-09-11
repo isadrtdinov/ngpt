@@ -15,10 +15,9 @@ def to_spherical(x):
         torch.cumsum(
             torch.flip(x.square(), dims=(-1, )), dim=-1
         ), dims=(-1, )
-    )
-    angles = torch.atan2(denom[..., 1:].sqrt(), x[..., :-1])
+    ).sqrt()
+    angles = torch.atan2(denom[..., 1:], x[..., :-1])
     angles[..., -1] = torch.atan2(x[..., -1], x[..., -2])
-    angles[..., -1] = torch.where(angles[..., -1] > 0, angles[..., -1], angles[..., -1])
     radii = denom[..., 0]
     return radii, angles
 

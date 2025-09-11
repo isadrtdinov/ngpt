@@ -72,7 +72,7 @@ wandb_project = 'nGPT'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 1 # used to simulate larger batch sizes
+gradient_accumulation_steps = 2 # used to simulate larger batch sizes
 batch_size = 64 # if gradient_accumulation_steps > 1, this is the micro-batch size
 # model
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
@@ -88,7 +88,7 @@ decay_lr = False # whether to decay the learning rate
 fix_elr = False # whether to train with fixed ELR instead of fixed LR
 lr_decay_iters = 600000 # should be ~= max_iters per
 # entropy estimation params
-entropy_queue_size = 100
+entropy_queue_size = 30
 entropy_log_freq = 50
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
@@ -186,16 +186,20 @@ if os.path.exists('./../../data'):
     data_dir = os.path.join('./../../data', dataset)
 else:   
     data_dir = os.path.join('data', dataset)
-train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+#train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+#val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+train_data = np.fromfile(os.path.join(data_dir, 'train.bin'), dtype=np.uint16)
+val_data = np.fromfile(os.path.join(data_dir, 'val.bin'), dtype=np.uint16)
 
 def get_batch(split):
     # We recreate np.memmap every batch to avoid a memory leak, as per
     # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        #data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        data = train_data
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        #data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+        data = val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
@@ -463,7 +467,7 @@ while True:
         rng_state_pytorch = torch.get_rng_state()
         rng_state_bytes = rng_state_pytorch.numpy().tobytes()
         losses = estimate_loss()
-        spherical_entropy, log_radius = logger.get_entropy()
+        spherical_entropy, log_radius = entropy_logger.get_entropy()
         si_params, non_si_params = get_param_vectors()
         si_radius = si_params.square().sum().sqrt().item()
         non_si_radius = non_si_params.square().sum().sqrt().item()
@@ -489,7 +493,7 @@ while True:
                 "radius/total": total_radius,
                 "lr": lr
             }
-            if iter_num == start_iter_num:
+            if iter_num == starting_iter_num:
                 log_dict.update({
                     'num_si_params': len(si_params),
                     'num_non_si_params': len(non_si_params),
@@ -539,6 +543,14 @@ while True:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     optimizer.step()
     # flush the gradients as soon as we can, no need for this memory anymore
+    # start with all of the candidate parameters
+    param_dict = {pn: p for pn, p in model.named_parameters()}
+    # filter out those that do not require grad
+    param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+    # Any 2D parameters are scale invariant, otherwise no.
+    # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+    si_params_gn = torch.cat([p.grad.data.cpu().reshape(-1) for n, p in param_dict.items() if p.dim() >= 2]).norm()
+    non_si_params_gn = torch.cat([p.grad.data.cpu().reshape(-1) for n, p in param_dict.items() if p.dim() < 2]).norm()
     optimizer.zero_grad(set_to_none=True)
 
     # timing and logging
@@ -553,7 +565,7 @@ while True:
         si_radius = si_params.square().sum().sqrt().item()
         non_si_radius = non_si_params.square().sum().sqrt().item()
         total_radius = math.sqrt(si_radius ** 2 + non_si_radius ** 2)
-        print(f"iter {iter_num}: loss {lossf:.6f}, time {dt*1000:.2f}ms")
+        print(f"iter {iter_num}: loss {lossf:.6f}, time {dt*1000:.2f}ms, SI grad norm: {si_params_gn:.2e}, non-SI grad norm: {non_si_params_gn:.2e}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
